@@ -31,23 +31,11 @@ const SPIN_MS = Number(process.env.SPIN_MS) || 7000;      // длительно�
 const RESULT_MS = Number(process.env.RESULT_MS) || 6000;  // показ победителя до нового раунда
 const COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899", "#14b8a6", "#f97316", "#84cc16", "#06b6d4"];
 
-// ---------- СТИКЕРЫ И ОГОНЁК-МНОЖИТЕЛЬ ----------
-const FLAME_EVERY_MS = Number(process.env.FLAME_EVERY_MS) || 5 * 60000; // раз в 5 минут
-const FLAME_TTL_MS = 3000;                                              // огонёк висит 3 секунды
-const BONUS_CAP_CENTS = Math.round((Number(process.env.BONUS_CAP) || 50) * 100); // макс. доплата казино за раунд, $
-const EMOTES = new Set(["fire", "heart", "like", "dislike", "sad", "laugh", "wow", "money", "luck"]);
-// Чаще всего 1.1–1.4, редко x2, иногда x3, очень редко x4–x5 (веса в сумме 100)
-const BOOSTS = [[1.1, 34], [1.2, 22], [1.3, 18], [1.4, 12], [1.5, 6], [2, 5], [3, 2.2], [4, 0.6], [5, 0.2]];
-function rollBoost() {
-  let r = crypto.randomInt(0, 100000) / 1000;
-  for (const b of BOOSTS) { r -= b[1]; if (r < 0) return b[0]; }
-  return BOOSTS[0][0];
-}
-let lastFlameAt = Date.now();
-let flame = null;           // {id, claimed:Set} — активный огонёк
-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const safeName = s => String(s || "Игрок").replace(/[<>&"']/g, "").slice(0, 20) || "Игрок";
+
+// Ссылка на аватарку из Telegram: пропускаем только https и разумную длину
+const safePhoto = s => { s = String(s || ""); return /^https:\/\/[^\s"'<>]{4,300}$/.test(s) ? s : ""; };
 
 // ---------- МОСТ К APPS SCRIPT ----------
 async function bridge(action, payload, tries, retryAll) {
@@ -95,7 +83,7 @@ function verifyInitData(initData) {
   let user = {};
   try { user = JSON.parse(params.get("user") || "{}"); } catch (e) { throw new Error("Не удалось прочитать игрока."); }
   if (!user.id) throw new Error("Нет ID игрока.");
-  return {id: String(user.id), name: safeName(user.username || user.first_name)};
+  return {id: String(user.id), name: safeName(user.username || user.first_name), photo: safePhoto(user.photo_url)};
 }
 
 // ---------- СОСТОЯНИЕ РАУНДА ----------
@@ -105,13 +93,13 @@ let round = newRound();
 const failedSettles = [];   // выплаты, которые не прошли — повторяем
 
 function newRound() {
-  return {id: crypto.randomUUID(), phase: "waiting", endsAt: 0, spinEndsAt: 0, bets: [], pending: 0, pendingBy: new Map(), boosts: new Map(), result: null};
+  return {id: crypto.randomUUID(), phase: "waiting", endsAt: 0, spinEndsAt: 0, bets: [], pending: 0, pendingBy: new Map(), result: null};
 }
 function aggregate(r) {
   const map = new Map();
   r.bets.forEach(function (b) {
     let p = map.get(b.userid);
-    if (!p) { p = {userid: b.userid, name: b.name, cents: 0, color: COLORS[map.size % COLORS.length]}; map.set(b.userid, p); }
+    if (!p) { p = {userid: b.userid, name: b.name, photo: b.photo || "", cents: 0, color: COLORS[map.size % COLORS.length]}; map.set(b.userid, p); }
     p.cents += b.cents;
   });
   return Array.from(map.values());
@@ -123,7 +111,7 @@ function publicState() {
   const ps = aggregate(round), total = ps.reduce(function (s, p) { return s + p.cents; }, 0);
   return {type: "state", history: history, round: {
     id: round.id, phase: round.phase, endsAt: round.endsAt, spinEndsAt: round.spinEndsAt, now: Date.now(),
-    players: ps.map(function (p) { return {userid: p.userid, name: p.name, amount: p.cents / 100, color: p.color, boost: round.boosts.get(p.userid) || 0}; }),
+    players: ps.map(function (p) { return {userid: p.userid, name: p.name, photo: p.photo, amount: p.cents / 100, color: p.color}; }),
     total: total / 100, min: MIN_CENTS / 100, max: MAX_CENTS / 100, fee: FEE_PCT, result: round.result}};
 }
 
@@ -162,7 +150,7 @@ async function handleBet(ws, m) {
   try {
     const betId = crypto.randomUUID();
     const d = await bridge("pvp_bet", {userid: u.id, round_id: r.id, bet_id: betId, amount: cents / 100});
-    r.bets.push({betId: betId, userid: u.id, name: u.name, cents: cents});
+    r.bets.push({betId: betId, userid: u.id, name: u.name, photo: u.photo, cents: cents});
     send(ws, {type: "balance", balance: d.balance});
     send(ws, {type: "bet_ok"});
     if (r.phase === "waiting" && aggregate(r).length >= 2) startCountdown(r);
@@ -176,41 +164,13 @@ async function handleBet(ws, m) {
   }
 }
 
-function handleEmote(ws, m) { // стикер видят все, кроме отправителя (у него он уже показан)
-  if (!EMOTES.has(m.id)) return;
-  const data = JSON.stringify({type: "emote", userid: ws.user.id, id: m.id});
-  wss.clients.forEach(function (c) { if (c !== ws && c.user && c.readyState === 1) c.send(data); });
-}
-function handleFlameClaim(ws, m) {
-  const u = ws.user, f = flame;
-  if (!f || f.id !== m.id || round.phase !== "countdown") return send(ws, {type: "info", message: "Огонёк уже погас"});
-  if (!aggregate(round).some(function (p) { return p.userid === u.id; })) return send(ws, {type: "info", message: "Сначала сделай ставку, потом лови огонёк!"});
-  if (f.claimed.has(u.id)) return;
-  f.claimed.add(u.id);
-  const mult = rollBoost();
-  round.boosts.set(u.id, mult);
-  send(ws, {type: "flame_result", mult: mult});
-  broadcastState();
-}
-
 function startCountdown(r) {
   r.phase = "countdown";
   r.endsAt = Date.now() + COUNTDOWN_MS;
-  if (Date.now() - lastFlameAt >= FLAME_EVERY_MS) { // пора: огонёк появится в этом раунде
-    lastFlameAt = Date.now();
-    setTimeout(function () {
-      if (round !== r || r.phase !== "countdown") return;
-      flame = {id: crypto.randomUUID(), claimed: new Set()};
-      const f = flame;
-      broadcast({type: "flame", id: f.id, x: 12 + crypto.randomInt(0, 76), y: 15 + crypto.randomInt(0, 70), ttl: FLAME_TTL_MS});
-      setTimeout(function () { if (flame === f) flame = null; }, FLAME_TTL_MS + 500);
-    }, 4000 + crypto.randomInt(0, 8000));
-  }
   setTimeout(function () { finishRound(r).catch(function (e) { console.error("finishRound", e); }); }, COUNTDOWN_MS);
 }
 
 function nextRound() {
-  flame = null;
   round = newRound();
   broadcastState();
 }
@@ -244,18 +204,15 @@ async function finishRound(r) {
   const ticket = crypto.randomInt(0, totalCents);
   let acc = 0, winner = ps[ps.length - 1];
   for (let i = 0; i < ps.length; i++) { acc += ps[i].cents; if (ticket < acc) { winner = ps[i]; break; } }
-  const baseCents = Math.floor(totalCents * (100 - FEE_PCT) / 100);
-  const mult = r.boosts.get(winner.userid) || 1;                       // множитель огонька победителя
-  const bonusCents = mult > 1 ? Math.min(BONUS_CAP_CENTS, Math.round(baseCents * (mult - 1))) : 0; // доплату платит казино
-  const payoutCents = baseCents + bonusCents;
+  const payoutCents = Math.floor(totalCents * (100 - FEE_PCT) / 100);
   const fraction = (ticket + crypto.randomInt(0, 1000) / 1000) / totalCents; // позиция на колесе, 0..1 по часовой от верха
 
-  r.result = {winner: {userid: winner.userid, name: winner.name}, fraction: fraction, payout: payoutCents / 100, total: totalCents / 100, boost: mult > 1 ? mult : 0};
+  r.result = {winner: {userid: winner.userid, name: winner.name}, fraction: fraction, payout: payoutCents / 100, total: totalCents / 100};
   r.phase = "spin";
   r.spinEndsAt = Date.now() + SPIN_MS;
   broadcastState();
 
-  const settleP = settle({round_id: r.id, winner: winner.userid, payout: payoutCents / 100, bonus: bonusCents / 100, bet_ids: r.bets.map(function (b) { return b.betId; })});
+  const settleP = settle({round_id: r.id, winner: winner.userid, payout: payoutCents / 100, bet_ids: r.bets.map(function (b) { return b.betId; })});
   await Promise.all([sleep(SPIN_MS), settleP]);
 
   history.unshift({name: winner.name, payout: payoutCents / 100, total: totalCents / 100});
@@ -282,7 +239,7 @@ wss.on("connection", function (ws) {
   ws.on("error", function () {});
 
   ws.on("message", async function (raw) {
-    if (++ws.msgCount > 30) return ws.close(); // защита от спама
+    if (++ws.msgCount > 15) return ws.close(); // защита от спама
     let m;
     try { m = JSON.parse(String(raw)); } catch (e) { return; }
     try {
@@ -304,8 +261,6 @@ wss.on("connection", function (ws) {
       }
       if (!ws.user) return;
       if (m.type === "bet") await handleBet(ws, m);
-      else if (m.type === "emote") handleEmote(ws, m);
-      else if (m.type === "flame_claim") handleFlameClaim(ws, m);
     } catch (e) { console.error("message error", e); }
   });
 });
