@@ -161,7 +161,7 @@ async function handleBet(ws, m) {
   const cents = Math.round(Number(m.amount) * 100);
   if (!Number.isInteger(cents) || cents < MIN_CENTS || cents > MAX_CENTS) return send(ws, {type: "error", message: "Ставка от $0.10 до $100."});
   if (userCents(r, u.id) + cents > MAX_CENTS) return send(ws, {type: "error", message: "Максимум $100 на раунд."});
-  if (ws.betting) return;
+  if (ws.betting || ws.cancelling) return;
   ws.betting = true;
   r.pending++;
   r.pendingBy.set(u.id, (r.pendingBy.get(u.id) || 0) + cents);
@@ -179,6 +179,51 @@ async function handleBet(ws, m) {
     r.pending--;
     r.pendingBy.set(u.id, (r.pendingBy.get(u.id) || 0) - cents);
     ws.betting = false;
+  }
+}
+
+
+// Отмена всех ставок подключённого игрока в текущем раунде.
+// pending не позволяет finishRound начать расчёт до ответа Apps Script.
+async function handleCancelBet(ws) {
+  const u = ws.user, r = round;
+  if (!ready) return send(ws, {type: "error", message: "Сервер запускается. Попробуй ещё раз."});
+  if (r.phase !== "waiting" && r.phase !== "countdown") {
+    return send(ws, {type: "error", message: "Раунд уже закрывается. Отменить ставку нельзя."});
+  }
+  if (ws.betting || ws.cancelling || (r.pendingBy.get(u.id) || 0) > 0) {
+    return send(ws, {type: "error", message: "Дождись подтверждения текущей операции."});
+  }
+
+  const mine = r.bets.filter(function (b) { return b.userid === u.id; });
+  if (!mine.length) return send(ws, {type: "error", message: "У тебя нет ставки для отмены."});
+
+  ws.cancelling = true;
+  r.pending++;
+  const betIds = mine.map(function (b) { return b.betId; });
+  try {
+    const d = await bridge("pvp_cancel", {
+      userid: u.id,
+      round_id: r.id,
+      bet_ids: betIds
+    }, 3, true);
+
+    const ids = new Set(betIds);
+    r.bets = r.bets.filter(function (b) { return !ids.has(b.betId); });
+
+    send(ws, {type: "balance", balance: d.balance});
+    send(ws, {
+      type: "cancel_ok",
+      amount: Number(d.cancelled_amount) || 0,
+      count: Number(d.cancelled_count) || 0,
+      balance: d.balance
+    });
+    broadcastState();
+  } catch (e) {
+    send(ws, {type: "error", message: String(e.message || "Не удалось отменить ставку")});
+  } finally {
+    r.pending--;
+    ws.cancelling = false;
   }
 }
 
@@ -208,8 +253,9 @@ async function settle(payload) {
 async function finishRound(r) {
   r.phase = "locking";
   broadcastState();
-  const t0 = Date.now();
-  while (r.pending > 0 && Date.now() - t0 < 30000) await sleep(100);
+  // Не начинаем расчёт, пока списание/отмена ставки не завершились.
+  // Apps Script bridge имеет собственные сетевые таймауты и повторные попытки.
+  while (r.pending > 0) await sleep(100);
 
   const ps = aggregate(r);
   if (ps.length < 2) { // некому играть — возвращаем ставки
@@ -279,6 +325,7 @@ wss.on("connection", function (ws) {
       }
       if (!ws.user) return;
       if (m.type === "bet") await handleBet(ws, m);
+      else if (m.type === "cancel_bet") await handleCancelBet(ws);
       else if (m.type === "emote") handleEmote(ws, m);
     } catch (e) { console.error("message error", e); }
   });
